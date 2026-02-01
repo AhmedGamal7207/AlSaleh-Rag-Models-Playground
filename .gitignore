@@ -1,3 +1,4 @@
 ./processed_docs/
 القوانين.json
 اللوائح.json
+./qdrant_db/
