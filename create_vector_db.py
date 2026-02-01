@@ -1,6 +1,5 @@
 import os
-import re
-import math
+import json
 from typing import List, Dict, Generator
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
@@ -15,7 +14,7 @@ MODEL_NAME = "intfloat/multilingual-e5-large"
 VECTOR_DIM = 1024 # Dimension for e5-large
 COLLECTION_NAME = "legal_documents"
 DB_PATH = "./qdrant_db" # Local storage path
-BATCH_SIZE = 16 # Adjust based on VRAM/RAM
+BATCH_SIZE = 32 # Increased slightly as text processing is lighter now
 
 class VectorDBBuilder:
     def __init__(self, model_name: str, db_path: str, collection_name: str, vector_dim: int):
@@ -51,49 +50,33 @@ class VectorDBBuilder:
 
     def read_processed_files(self, source_dir: str) -> Generator[Dict, None, None]:
         """
-        Yields structured chunks from the processed text files.
+        Yields structured chunks from the processed local JSONL files.
         """
-        files = [f for f in os.listdir(source_dir) if f.endswith('.txt')]
+        files = [f for f in os.listdir(source_dir) if f.endswith('.jsonl')]
         total_files = len(files)
-        print(f"Found {total_files} files to process.")
+        print(f"Found {total_files} JSONL files to process.")
 
         for file_idx, file_name in enumerate(files):
             file_path = os.path.join(source_dir, file_name)
             
-            # Extract basic doc ID from filename (e.g. 1081.txt -> 1081)
-            doc_id_base = os.path.splitext(file_name)[0]
-            
             try:
+                print(f"Reading {file_name}...")
                 with open(file_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                    
-                # Split content into chunks based on separator
-                # Regex looks for "--- CHUNK n ---"
-                raw_chunks = re.split(r'--- CHUNK \d+ ---\n', content)
-                
-                # Filter out empty strings from split
-                chunks = [c.strip() for c in raw_chunks if c.strip()]
-                
-                for chunk_idx, chunk_text in enumerate(chunks):
-                    # We treat the entire chunk text (Header + Content) as the 'text' to embed,
-                    # as the header contains critical context (Title, Law Name).
-                    # 'e5' models expect "passage: " prefix for optimal performance.
-                    
-                    yield {
-                        "id": f"{doc_id_base}_{chunk_idx}",
-                        "text": chunk_text,
-                        "metadata": {
-                            "source_file": file_name,
-                            "doc_id": doc_id_base,
-                            "chunk_index": chunk_idx
-                        }
-                    }
-                    
+                    for line_num, line in enumerate(f):
+                        if not line.strip():
+                            continue
+                        try:
+                            # Parse JSON line
+                            chunk_data = json.loads(line)
+                            yield chunk_data
+                        except json.JSONDecodeError as e:
+                            print(f"Error decoding JSON at line {line_num} in {file_name}: {e}")
+                            
             except Exception as e:
                 print(f"Error reading {file_name}: {e}")
 
-            if (file_idx + 1) % 100 == 0:
-                print(f"Processed {file_idx + 1}/{total_files} files...", end='\r')
+            if (file_idx + 1) % 1 == 0:
+                print(f"Finished file {file_idx + 1}/{total_files}...", end='\r')
 
     def embed_and_upsert(self, source_dir: str):
         """
@@ -111,8 +94,8 @@ class VectorDBBuilder:
         
         for doc in chunk_stream:
             # Prepare text for e5 model (passage prefix)
-            # The model requires 'passage: ' before the text for indexing tasks
-            formatted_text = f"passage: {doc['text']}"
+            # Use 'vector_text' which contains the rich context
+            formatted_text = f"passage: {doc['vector_text']}"
             
             batch_docs.append(doc)
             batch_texts.append(formatted_text)
@@ -139,27 +122,19 @@ class VectorDBBuilder:
                 texts, 
                 normalize_embeddings=True, 
                 show_progress_bar=False,
-                batch_size=len(texts) # Since we strictly control batch size in the loop
+                batch_size=len(texts)
             )
             
             # Prepare points for Qdrant
             points = []
             for i, doc in enumerate(docs):
-                # Qdrant requires integer or UUID ids, or string UUIDs. 
-                # We will use UUID generation usually, but here we can rely on hashing or just auto-gen.
-                # Ideally, we hash the string ID to a UUID.
-                # However, Qdrant Python client handles string IDs if we are careful, 
-                # but let's use a hash to be safe and efficient.
-                import uuid
-                point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, doc["id"]))
+                # Use the pre-calculated deterministic hash ID
+                point_id = doc["id"]
                 
                 points.append(models.PointStruct(
                     id=point_id,
                     vector=embeddings[i].tolist(),
-                    payload={
-                        "text": doc["text"], # Store original text for retrieval
-                        **doc["metadata"]
-                    }
+                    payload=doc["payload"]
                 ))
             
             # Upload
@@ -176,6 +151,7 @@ def main():
     
     if not os.path.exists(source_dir):
         print(f"Error: Directory {source_dir} not found.")
+        print("Please run json_to_rag_chunks.py first.")
         return
 
     # Initialize Builder
