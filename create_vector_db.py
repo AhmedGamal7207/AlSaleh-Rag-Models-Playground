@@ -1,10 +1,12 @@
 import os
-import json
+import re
+import math
 from typing import List, Dict, Generator
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from sentence_transformers import SentenceTransformer
 import sys
+import uuid
 
 # Configuration
 # "intfloat/multilingual-e5-large" is State-of-the-Art for multilingual retrieval
@@ -14,9 +16,9 @@ MODEL_NAME = "intfloat/multilingual-e5-large"
 VECTOR_DIM = 1024 # Dimension for e5-large
 COLLECTION_NAME = "legal_documents"
 DB_PATH = "./qdrant_db" # Local storage path
-BATCH_SIZE = 32 # Increased slightly as text processing is lighter now
+BATCH_SIZE = 16 # Adjust based on VRAM/RAM
 
-class VectorDBBuilder:
+class VectorDBBuilderFixed:
     def __init__(self, model_name: str, db_path: str, collection_name: str, vector_dim: int):
         self.model_name = model_name
         self.db_path = db_path
@@ -48,35 +50,100 @@ class VectorDBBuilder:
                 )
             )
 
+    def extract_metadata_from_chunk(self, chunk_text: str) -> Dict[str, Any]:
+        """
+        Naive extraction of metadata from the chunk text itself (Header).
+        In the fixed pipeline, metadata is encoded in the text header.
+        We can use Regex to pull it out for the payload.
+        """
+        metadata = {}
+        
+        # Extract patterns
+        # Decision Name: Decision: <...>
+        # Address: Address: <...>
+        # Categories: Categories: <...> (We added this in json_to_rag_chunks.py)
+        
+        # Arabic regex patterns based on header format:
+        # header = f"وثيقة رقم: {e_id}\n"
+        # header += f"القرار: {name}\n"
+        # header += f"العنوان: {address}\n"
+        # header += f"التصنيف: {cat_str}\n" 
+        
+        id_match = re.search(r"وثيقة رقم:\s*(.*)", chunk_text)
+        if id_match: metadata['doc_id'] = id_match.group(1).strip()
+        
+        dec_match = re.search(r"القرار:\s*(.*)", chunk_text)
+        if dec_match: metadata['law_name'] = dec_match.group(1).strip()
+        
+        cat_match = re.search(r"التصنيف:\s*(.*)", chunk_text)
+        if cat_match:
+            cat_str = cat_match.group(1).strip()
+            # Convert string list "['A', 'B']" or plain "A, B" to list
+            # Usually safe to just store as list of strings
+            # If it looks like a python list string, eval it safely or parse it
+            if cat_str.startswith('[') and cat_str.endswith(']'):
+                try:
+                    # simplistic parse
+                    metadata['categories'] = eval(cat_str) 
+                except:
+                    metadata['categories'] = [cat_str]
+            else:
+                metadata['categories'] = [c.strip() for c in cat_str.split(',') if c.strip()]
+
+        # We can also store the Law/header info
+        # But crucially we need categories for the filter to work
+        return metadata
+
     def read_processed_files(self, source_dir: str) -> Generator[Dict, None, None]:
         """
-        Yields structured chunks from the processed local JSONL files.
+        Yields structured chunks from the processed text files.
         """
-        files = [f for f in os.listdir(source_dir) if f.endswith('.jsonl')]
+        files = [f for f in os.listdir(source_dir) if f.endswith('.txt')]
         total_files = len(files)
-        print(f"Found {total_files} JSONL files to process.")
+        print(f"Found {total_files} files to process.")
 
         for file_idx, file_name in enumerate(files):
             file_path = os.path.join(source_dir, file_name)
             
+            # Extract basic doc ID from filename (e.g. 1081.txt -> 1081)
+            doc_id_base = os.path.splitext(file_name)[0]
+            
             try:
-                print(f"Reading {file_name}...")
                 with open(file_path, 'r', encoding='utf-8') as f:
-                    for line_num, line in enumerate(f):
-                        if not line.strip():
-                            continue
-                        try:
-                            # Parse JSON line
-                            chunk_data = json.loads(line)
-                            yield chunk_data
-                        except json.JSONDecodeError as e:
-                            print(f"Error decoding JSON at line {line_num} in {file_name}: {e}")
-                            
+                    content = f.read()
+                    
+                # Split content into chunks based on separator
+                # Regex looks for "--- CHUNK n ---"
+                raw_chunks = re.split(r'--- CHUNK \d+ ---\n', content)
+                
+                # Filter out empty strings from split
+                chunks = [c.strip() for c in raw_chunks if c.strip()]
+                
+                for chunk_idx, chunk_text in enumerate(chunks):
+                    # We treat the entire chunk text (Header + Content) as the 'text' to embed,
+                    # as the header contains critical context (Title, Law Name).
+                    # 'e5' models expect "passage: " prefix for optimal performance.
+                    
+                    # Extract metadata for Payload
+                    extracted_meta = self.extract_metadata_from_chunk(chunk_text)
+                    
+                    yield {
+                        "id": f"{doc_id_base}_{chunk_idx}",
+                        "text": chunk_text,
+                        "metadata": {
+                            "source_file": file_name,
+                            "doc_id": doc_id_base,
+                            "chunk_index": chunk_idx,
+                            "text_content": chunk_text, # Store text in payload for retrieval display
+                            **extracted_meta
+                        }
+                    }
+                    
             except Exception as e:
                 print(f"Error reading {file_name}: {e}")
 
-            if (file_idx + 1) % 1 == 0:
-                print(f"Finished file {file_idx + 1}/{total_files}...", end='\r')
+            if (file_idx + 1) % 100 == 0:
+                print(f"Processed {file_idx + 1}/{total_files} files...", end='\r')
 
     def embed_and_upsert(self, source_dir: str):
         """
@@ -94,8 +161,8 @@ class VectorDBBuilder:
         
         for doc in chunk_stream:
             # Prepare text for e5 model (passage prefix)
-            # Use 'vector_text' which contains the rich context
-            formatted_text = f"passage: {doc['vector_text']}"
+            # The model requires 'passage: ' before the text for indexing tasks
+            formatted_text = f"passage: {doc['text']}"
             
             batch_docs.append(doc)
             batch_texts.append(formatted_text)
@@ -122,19 +189,19 @@ class VectorDBBuilder:
                 texts, 
                 normalize_embeddings=True, 
                 show_progress_bar=False,
-                batch_size=len(texts)
+                batch_size=len(texts) # Since we strictly control batch size in the loop
             )
             
             # Prepare points for Qdrant
             points = []
             for i, doc in enumerate(docs):
-                # Use the pre-calculated deterministic hash ID
-                point_id = doc["id"]
+                # UUID generation
+                point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, doc["id"]))
                 
                 points.append(models.PointStruct(
                     id=point_id,
                     vector=embeddings[i].tolist(),
-                    payload=doc["payload"]
+                    payload=doc["metadata"]
                 ))
             
             # Upload
@@ -151,11 +218,10 @@ def main():
     
     if not os.path.exists(source_dir):
         print(f"Error: Directory {source_dir} not found.")
-        print("Please run json_to_rag_chunks.py first.")
         return
 
     # Initialize Builder
-    builder = VectorDBBuilder(
+    builder = VectorDBBuilderFixed(
         model_name=MODEL_NAME,
         db_path=DB_PATH,
         collection_name=COLLECTION_NAME,
